@@ -1,0 +1,455 @@
+name: NPM security action
+description: Github action to verify NPM security with different tools
+author: Pim Jansen <pim.jansen@topicus.nl>
+
+inputs:
+  node-version:
+    description: 'Node.js version to use'
+    required: false
+    default: '24'
+  package-manager:
+    description: 'Package manager (npm, yarn, pnpm)'
+    required: false
+    default: 'npm'
+  severity-threshold:
+    description: 'Minimum severity level to report (low, moderate, high, critical)'
+    required: false
+    default: 'moderate'
+  working-directory:
+    description: 'Working directory for the scan'
+    required: false
+    default: '.'
+  enable-pr-comments:
+    description: 'Enable automatic PR comments'
+    required: false
+    default: 'true'
+  socket-token:
+    description: 'Socket Security API token'
+    required: false
+    default: ''
+  snyk-token:
+    description: 'Snyk API token'
+    required: false
+    default: ''
+
+outputs:
+  vulnerabilities-found:
+    description: 'Whether vulnerabilities were found'
+    value: ${{ steps.check-results.outputs.vulnerabilities-found }}
+  scan-summary:
+    description: 'Summary of scan results'
+    value: ${{ steps.check-results.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install pnpm
+        if: inputs.package-manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs. node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        run: |
+          case "${{ inputs.package-manager }}" in
+            npm)
+              npm ci
+              ;;
+            yarn)
+              yarn install --frozen-lockfile
+              ;;
+            pnpm)
+              pnpm install --frozen-lockfile
+              ;;
+            *)
+              echo "Unsupported package manager: ${{ inputs.package-manager }}"
+              exit 1
+              ;;
+          esac
+        continue-on-error: true
+
+      # Tool 1: npm/yarn/pnpm audit
+      - name: Run package manager audit
+        shell: bash
+        id: pm-audit
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          EXIT_CODE=0
+          case "${{ inputs.package-manager }}" in
+            npm)
+              npm audit --audit-level=${{ inputs.severity-threshold }} | tee audit-results.txt || EXIT_CODE=$?
+              ;;
+            yarn)
+              yarn audit --level ${{ inputs.severity-threshold }} | tee audit-results.txt || EXIT_CODE=$?
+              ;;
+            pnpm)
+              pnpm audit --audit-level ${{ inputs.severity-threshold }} | tee audit-results.txt || EXIT_CODE=$?
+              ;;
+          esac
+          echo "exit-code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      # Tool 2: Socket Security (malware and supply chain detection)
+      - name: Socket Security Scan
+        id: socket
+        uses: SocketDev/action@v1
+        with:
+          mode: ${{ inputs.socket-token != '' && 'firewall-enterprise' || 'firewall-free' }}
+          socket-token: ${{ inputs.socket-token }}
+        continue-on-error: true
+
+      # Tool 3: Snyk (comprehensive vulnerability scanning)
+      - name: Snyk Security Scan
+        id: snyk
+        uses: snyk/actions/node@master
+        if: inputs.snyk-token != ''
+        env:
+          SNYK_TOKEN: ${{ inputs.snyk-token }}
+        with:
+          command: test
+          args: --severity-threshold=${{ inputs.severity-threshold }} --json-file-output=snyk-results.json
+        continue-on-error: true
+
+      - name: Process Snyk results
+        id: snyk-check
+        shell: bash
+        if: inputs.snyk-token != '' && always()
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          SNYK_FAILED=0
+          if [ "${{ steps.snyk.outcome }}" == "failure" ]; then
+            SNYK_FAILED=1
+          fi
+          echo "failed=$SNYK_FAILED" >> $GITHUB_OUTPUT
+          
+          # Generate human-readable summary from JSON
+          if [ -f snyk-results.json ]; then
+            echo "" >> snyk-summary.txt
+            
+            # Parse JSON to extract vulnerability counts and details
+            if command -v jq &> /dev/null; then
+              # If jq is available, use it for better parsing
+              jq -r '
+                if .vulnerabilities then
+                  "**Total vulnerabilities found:** " + (.vulnerabilities | length | tostring) + "\n" +
+                  "\n**By Severity:**\n" +
+                  "- Critical: " + ([.vulnerabilities[] | select(.severity == "critical")] | length | tostring) + "\n" +
+                  "- High: " + ([.vulnerabilities[] | select(.severity == "high")] | length | tostring) + "\n" +
+                  "- Medium: " + ([.vulnerabilities[] | select(.severity == "medium")] | length | tostring) + "\n" +
+                  "- Low: " + ([.vulnerabilities[] | select(.severity == "low")] | length | tostring) + "\n"
+                else
+                  "Unable to parse vulnerability details"
+                end
+              ' snyk-results.json >> snyk-summary.txt 2>/dev/null || echo "JSON parsing failed" >> snyk-summary.txt
+            else
+              # Fallback: basic grep-based parsing
+              echo "Full JSON report available in artifacts" >> snyk-summary.txt
+            fi
+          fi
+
+      # Tool 4: Trivy (vulnerability scanner with SARIF output)
+      - name: Set Trivy severity
+        id: trivy-severity
+        shell: bash
+        run: |
+          case "${{ inputs.severity-threshold }}" in
+            low)
+              echo "severity=CRITICAL,HIGH,MEDIUM,LOW" >> $GITHUB_OUTPUT
+              ;;
+            moderate)
+              echo "severity=CRITICAL,HIGH,MEDIUM" >> $GITHUB_OUTPUT
+              ;;
+            high)
+              echo "severity=CRITICAL,HIGH" >> $GITHUB_OUTPUT
+              ;;
+            critical)
+              echo "severity=CRITICAL" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Run Trivy vulnerability scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: ${{ inputs.working-directory }}
+          format: 'table'
+          output: 'trivy-results.txt'
+          severity: ${{ steps.trivy-severity.outputs.severity }}
+          version: latest
+        continue-on-error: true
+
+      - name: Check Trivy results
+        if: always()
+        id: trivy-check
+        shell: bash
+        run: |
+          # Check if trivy found any vulnerabilities
+          TRIVY_FAILED=0
+          if [ -f trivy-results.txt ]; then
+            if grep -q "Total:" trivy-results.txt && ! grep -q "Total: 0" trivy-results.txt; then
+              TRIVY_FAILED=1
+            fi
+          fi
+          echo "failed=$TRIVY_FAILED" >> $GITHUB_OUTPUT
+
+      # Check if any tool failed
+      - name: Fail if vulnerabilities found
+        if: always()
+        shell: bash
+        run: |
+          if [ "${{ steps.pm-audit.outputs.exit-code }}" != "0" ]; then
+            echo "❌ Package manager audit found vulnerabilities"
+            exit 1
+          fi
+          if [ "${{ steps.snyk-check.outputs.failed }}" == "1" ]; then
+            echo "❌ Snyk found vulnerabilities"
+            exit 1
+          fi
+          if [ "${{ steps.trivy-check.outputs.failed }}" == "1" ]; then
+            echo "❌ Trivy found vulnerabilities"
+            exit 1
+          fi
+          if [ "${{ steps.audit-ci.outputs.exit-code }}" != "0" ]; then
+            echo "❌ Audit-CI found vulnerabilities"
+            exit 1
+          fi
+          echo "✅ No vulnerabilities found"
+
+      # Tool 5: audit-ci (strict checking)
+      - name: Install audit-ci
+        shell: bash
+        run: npm install -g audit-ci
+
+      - name: Run audit-ci
+        id: audit-ci
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        env:
+          NO_COLOR: 1
+        run: |
+          set +e  # Don't exit on error
+          EXIT_CODE=0
+          
+          case "${{ inputs.severity-threshold }}" in
+            low)
+              audit-ci --low > audit-ci-results.txt 2>&1
+              EXIT_CODE=$?
+              ;;
+            moderate)
+              audit-ci --moderate > audit-ci-results.txt 2>&1
+              EXIT_CODE=$?
+              ;;
+            high)
+              audit-ci --high > audit-ci-results.txt 2>&1
+              EXIT_CODE=$?
+              ;;
+            critical)
+              audit-ci --critical > audit-ci-results.txt 2>&1
+              EXIT_CODE=$?
+              ;;
+          esac          
+          echo "exit-code=$EXIT_CODE" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      # Check results and set outputs
+      - name: Check results
+        id: check-results
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        run: |
+          vulnerabilities_found=false
+          summary="Security scan completed"
+          
+          if [ -f audit-results.txt ]; then
+            if grep -q "vulnerabilities" audit-results.txt; then
+              vulnerabilities_found=true
+              vuln_count=$(grep -oP '\d+(? = vulnerabilities)' audit-results.txt | head -1)
+              summary="Found ${vuln_count} vulnerabilities"
+            fi
+          fi
+          
+          echo "vulnerabilities-found=$vulnerabilities_found" >> $GITHUB_OUTPUT
+          echo "summary=$summary" >> $GITHUB_OUTPUT
+
+      # Summary Report
+      - name: Create Security Summary
+        if: always()
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+        run: |
+          echo "# 🛡️ Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Package Manager:** ${{ inputs.package-manager }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Node Version:** ${{ inputs.node-version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Severity Threshold:** ${{ inputs.severity-threshold }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Working Directory:** ${{ inputs.working-directory }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Scanned at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Package Manager Audit Results
+          echo "## 📦 Package Manager Audit Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f audit-results.txt ]; then
+            if [ "${{ steps.pm-audit.outputs.exit-code }}" != "0" ]; then
+              echo "❌ Vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ No vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            cat audit-results.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No audit results available" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Socket Security Results
+          echo "## 🔌 Socket Security Results" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.socket.outcome }}" == "success" ]; then
+            echo "✅ Socket scan completed - Check action logs for details" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "_Socket Security analyzes supply chain risks, malware, typosquatting, and other security issues._" >> $GITHUB_STEP_SUMMARY
+            echo "_Results are posted in action logs. Issues may be created for critical findings._" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ steps.socket.outcome }}" == "failure" ]; then
+            echo "❌ Socket scan found issues - Check action logs and repository issues" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Socket scan was skipped or failed to run" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Snyk Results
+          echo "## 🐍 Snyk Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ inputs.snyk-token }}" ]; then
+            if [ "${{ steps.snyk.outcome }}" == "success" ]; then
+              echo "✅ No vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            elif [ "${{ steps.snyk.outcome }}" == "failure" ]; then
+              echo "❌ Vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              if [ -f snyk-summary.txt ]; then
+                cat snyk-summary.txt >> $GITHUB_STEP_SUMMARY
+              fi
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "_Full JSON report available in artifacts_" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️ Snyk scan encountered an error" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ Snyk scan skipped (no token provided)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Trivy Results
+          echo "## 🔍 Trivy Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f trivy-results.txt ]; then
+            if [ "${{ steps.trivy-check.outputs.failed }}" == "1" ]; then
+              echo "❌ Vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "✅ No vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            cat trivy-results.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No Trivy results available" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Audit-CI Results
+          echo "## 🔒 Audit-CI Results" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.audit-ci.outputs.exit-code }}" == "0" ]; then
+            echo "✅ No vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ -f audit-ci-results.txt ]; then
+              echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+              cat audit-ci-results.txt >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+            echo "_Audit-CI applies stricter checking than standard npm audit_" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Overall Result
+          echo "## 📊 Overall Result" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.pm-audit.outputs.exit-code }}" != "0" ] || [ "${{ steps.snyk-check.outputs.failed }}" == "1" ] || [ "${{ steps.trivy-check.outputs.failed }}" == "1" ] || [ "${{ steps.audit-ci.outputs.exit-code }}" != "0" ]; then
+            echo "❌ **Security vulnerabilities detected**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ **No security vulnerabilities found**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      # Upload artifacts for later review
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-scan-results
+          path: |
+            ${{ inputs.working-directory }}/audit-results.txt
+            ${{ inputs.working-directory }}/audit-ci-results.txt
+            ${{ inputs.working-directory }}/snyk-results.json
+            ${{ inputs.working-directory }}/snyk-summary.txt
+            trivy-results.txt
+          retention-days: 30
+
+      # Optional: Comment on PR with results summary
+      - name: Comment PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request' && inputs.enable-pr-comments && always()
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            let comment = '## 🛡️ Security Scan Results\n\n';
+            
+            // Read audit results if available
+            const auditPath = path.join('${{ inputs.working-directory }}', 'audit-results.txt');
+            try {
+              const auditResults = fs.readFileSync(auditPath, 'utf8');
+              const vulnerabilities = auditResults.match(/(\d+) vulnerabilities/);
+              if (vulnerabilities) {
+                comment += `### Package Manager Audit\n${vulnerabilities[0]} found\n\n`;
+              } else {
+                comment += `### Package Manager Audit\n✅ No vulnerabilities found\n\n`;
+              }
+            } catch (e) {
+              comment += '### Package Manager Audit\n⚠️ Results not available\n\n';
+            }
+            
+            comment += '**Configuration:**\n';
+            comment += '- Package Manager: `${{ inputs.package-manager }}`\n';
+            comment += '- Node Version: `${{ inputs.node-version }}`\n';
+            comment += '- Severity Threshold: `${{ inputs.severity-threshold }}`\n\n';
+            
+            comment += '**Tools executed:**\n';
+            comment += '- ✅ ${{ inputs.package-manager }} audit\n';
+            comment += '- ✅ Trivy\n';
+            comment += '- ✅ audit-ci\n';
+            if ('${{ inputs.socket-token }}') {
+              comment += '- ✅ Socket Security\n';
+            } 
+            if ('${{ inputs.snyk-token }}') {
+              comment += '- ✅ Snyk\n';
+            }
+            comment += '\n📊 [View detailed results](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})';
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue. number,
+              owner: context. repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+        continue-on-error: true
